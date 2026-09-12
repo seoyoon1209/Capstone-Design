@@ -1,0 +1,9 @@
+{
+  "appId": "com.eonjun.geumyeonhaeduo202606",
+  "appName": "금연해듀오",
+  "webDir": "dist",
+  "server": {
+    "url": "https://2-h58i.onrender.com",
+    "cleartext": true
+  }
+}

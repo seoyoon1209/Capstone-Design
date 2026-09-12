@@ -1,0 +1,639 @@
+================================================================
+금연 클리닉 프로젝트 — 파일별 역할 및 로직 설명서
+================================================================
+
+작성 대상
+  1. 백엔드  : '-'  (FastAPI + asyncpg + PostgreSQL)
+  2. 프론트  : '-2-' 내부 ios  (Capacitor iPhone 브리지 + Apple Watch 앱)
+
+문서 형식
+  · 각 파일명 아래에 "역할 → 로직 → 주요 조건식 이유" 순서로 정리
+  · 조건 분기가 있는 경우 "왜 그 조건이 있는지"를 함께 기술
+
+
+################################################################
+[ PART 1 ] 백엔드  '-'
+################################################################
+
+
+────────────────────────────────────────────────
+main.py
+────────────────────────────────────────────────
+FastAPI 애플리케이션의 진입점이며 모든 라우터를 한곳에 등록한다.
+
+로직
+  · lifespan(앱 수명주기)에서
+      - 시작 시 : DB 커넥션 풀 init() → 스케줄러 start()
+      - 종료 시 : 스케줄러 stop() → DB 풀 dispose()
+    즉 "DB가 살아있는 동안만 서버가 요청을 받도록" 보장한다.
+  · CORSMiddleware로 허용 오리진을 명시한다.
+      - Render 배포 도메인, capacitor://localhost(모바일 앱),
+        localhost(개발) 만 허용하여 외부 무단 호출을 차단한다.
+  · include_router(..., prefix="/api") 로 전 라우터에 /api 접두사를 붙인다.
+    → 프론트는 항상 "/api/..." 로 호출한다.
+
+조건식 이유
+  · allow_origins를 *(전체)로 두지 않은 것은 credentials(쿠키/인증)를
+    허용하면서 보안을 유지하기 위함이다.
+
+
+────────────────────────────────────────────────
+scheduler.py  /  router/HeartScheduler.py
+────────────────────────────────────────────────
+역할
+  10초마다 raw 심박수(heart_rate_logs)를 user_id별 평균으로 집계해
+  watch_heart_logs에 저장하는 백그라운드 작업.
+
+로직
+  1. cutoff = 현재시각 - 10초.  created_at <= cutoff 인 raw 데이터만 집계
+     → "10초가 지나 더 들어올 일이 없는 데이터"만 안전하게 처리.
+  2. user_id별 AVG(bpm) 계산 후 watch_heart_logs에 INSERT.
+  3. 집계에 사용한 raw 행은 DELETE(중복 집계 방지 + 용량 절약).
+  4. watch_heart_logs는 user_id별 최신 120개만 유지(OFFSET 120 이후 삭제).
+     → 약 20분치 데이터만 보관.
+
+조건식 이유
+  · ON CONFLICT DO NOTHING : 같은 버킷이 중복 삽입되는 것을 막는다.
+  · pool is None 체크 : 서버 부팅 직후 DB 풀이 준비되기 전에
+    스케줄러가 먼저 돌면 None 접근 오류가 나므로 방어.
+
+(주의) scheduler.py와 HeartScheduler.py가 유사 기능을 한다.
+       실제 가동되는 것은 main.py가 import하는 scheduler.py 쪽이다.
+
+
+────────────────────────────────────────────────
+db/dbpool.py
+────────────────────────────────────────────────
+역할
+  asyncpg 커넥션 풀을 전역 1개 생성/관리하고, FastAPI 의존성으로 주입한다.
+
+로직
+  · init() : 이미 풀이 있으면 재생성하지 않음(if dbpool is not None: return).
+  · DSN을 Settings에서 읽어 ssl="require"로 연결(원격 DB 보안).
+  · max_inactive_connection_lifetime=30 : 30초 이상 놀던 연결을 자동 교체해
+    "끊긴 좀비 커넥션" 사용을 방지.
+  · get_db_connection() : async with로 커넥션을 빌려주고 자동 반납.
+  · DbPoolDep = Depends(get_db_connection) : 라우터에서 conn: DbPoolDep 로 주입.
+
+
+────────────────────────────────────────────────
+settings/Settings.py
+────────────────────────────────────────────────
+역할
+  .env 파일의 환경변수를 pydantic Settings로 읽어 타입 검증한다.
+
+로직
+  · DB 접속정보는 필수, 메일/OpenAI 키는 Optional(없어도 서버 구동 가능).
+  · @lru_cache 로 get_settings()를 캐싱 → .env를 매번 읽지 않음.
+
+
+────────────────────────────────────────────────
+router/UserLoginRouter.py
+────────────────────────────────────────────────
+역할
+  로그인. 사용자가 입력한 아이디/비밀번호를 DB 정보와 비교한다.
+
+로직
+  1. user_login_id로 app_user 행 조회.
+  2. 행이 없으면 401(아이디/비번 틀림) — 아이디 존재 여부를 노출하지 않으려
+     "아이디 또는 비밀번호가 틀렸습니다"로 통일.
+  3. is_active=false 이면 403(비활성 계정).
+  4. 입력 비밀번호를 SHA-256으로 1차 해싱 → 저장된 Argon2 해시와 verify.
+     (가입 때와 동일한 2단계 방식이라 검증이 일치한다.)
+  5. password_hash == "PENDING" 이면 401(가입 미완료 계정).
+
+조건식 이유
+  · "다른 경우(불일치) 조건식"이 여러 개인 이유:
+      - 행 없음 / 비활성 / 가입미완료 / 비번불일치를 각각 다른 상태코드로
+        구분해 프론트가 적절한 안내를 띄우도록 하기 위함.
+  · 비번 불일치와 아이디 없음을 같은 메시지로 처리하는 것은
+    계정 존재 여부를 공격자에게 흘리지 않기 위한 보안 처리.
+
+
+────────────────────────────────────────────────
+router/MembershipRouter.py
+────────────────────────────────────────────────
+역할
+  회원가입 2/3(기본정보 register)과 3/3(추가정보 extra) 처리.
+
+로직 (register)
+  1. email_token이 이메일과 일치하는지 확인(인증을 거친 사람만 가입 가능).
+  2. 비밀번호 SHA-256 → Argon2 2단계 해싱.
+  3. 트랜잭션 내에서:
+     - 이메일 인증 단계에서 만들어둔 PENDING 계정을 찾는다.
+     - 이미 is_active이거나 hash!='PENDING' 이면 409(이미 가입됨).
+     - email_verified_at 없으면 403(이메일 미인증).
+     - 전화번호 중복 검사(다른 user가 쓰면 409).
+     - PENDING → ACTIVE로 UPDATE + user_profile UPSERT.
+
+로직 (save_extra)
+  · 설문형 한글 라벨(주 2~3회 등)을 숫자/분 단위로 변환(map_* 헬퍼).
+  · 스키마에 없는 항목(흡연 시작나이, 담배 종류)은 note JSON으로 묶어 저장.
+  · health_behavior_snapshot에 UPSERT(ON CONFLICT user_id DO UPDATE).
+
+조건식 이유
+  · UniqueViolationError를 잡아 "어느 컬럼이 중복인지"에 따라
+    전화/로그인ID/이메일별로 다른 409 메시지를 돌려준다(사용자 안내 명확화).
+
+
+────────────────────────────────────────────────
+router/EmailRouter.py
+────────────────────────────────────────────────
+역할
+  회원가입용 이메일 인증번호 발송/검증.
+
+로직 (send-verification)
+  1. 이메일 형식 검사(@ 포함).
+  2. 6자리 코드 생성 → SHA-256 해싱하여 저장(원문 미저장).
+  3. 기존 PENDING 계정이 있으면 재사용, 없으면 PENDING 계정 신규 생성.
+  4. 이전 진행 중 코드 무효화(used_at 세팅) 후 새 토큰 INSERT(만료 10분).
+  5. 즉시 메일 발송(성공/실패를 바로 응답에 반영).
+
+로직 (verify)
+  · 코드 해시 + 미사용 + 미만료 조건을 모두 만족하는 토큰만 통과.
+  · 통과 시 used_at 기록 + app_user.email_verified_at 갱신.
+
+조건식 이유
+  · "이미 가입된 이메일"은 400으로 막아 중복가입 방지.
+  · 토큰을 해시로 저장하는 것은 DB 유출 시에도 코드가 노출되지 않게 함.
+
+
+────────────────────────────────────────────────
+router/TestRouter.py
+────────────────────────────────────────────────
+역할
+  아이디 찾기 / 비밀번호 재설정용 인증·변경 묶음(프론트 테스트 겸용).
+
+로직
+  · find-id    : 이름+전화 일치 시 로그인ID 반환, 없으면 404.
+  · send-verification : 가입된 이메일에 PASSWORD_RESET 코드 발송(만료 5분).
+  · verify     : 코드+타입+만료 조건 만족 토큰 확인.
+  · reset-pw   : 이름+이메일 일치 계정의 비밀번호를 SHA-256→Argon2로 변경,
+                 사용한 리셋 토큰 삭제.
+
+조건식 이유
+  · UPDATE 결과가 "UPDATE 0" 이면 일치 계정이 없다는 뜻 → 404 처리.
+
+
+────────────────────────────────────────────────
+router/UserInformation.py
+────────────────────────────────────────────────
+역할
+  마이페이지 회원정보 수정.
+
+로직
+  · 트랜잭션으로 app_user(이름/전화/이메일) + user_profile(성별/출생/키/몸무게/주소)
+    를 함께 갱신.
+  · 성별 한글(남성/여성) → DB 코드(M/F) 매핑.
+  · user_profile은 ON CONFLICT(user_id) DO UPDATE 로 없으면 생성/있으면 수정.
+
+조건식 이유
+  · user_login_id = user_email 동기화 : 이메일을 로그인ID로 쓰는 정책 때문.
+
+
+────────────────────────────────────────────────
+router/UserDeleteRouter.py
+────────────────────────────────────────────────
+역할
+  회원 탈퇴(계정 삭제).
+
+로직
+  · app_user 1행 DELETE → FK CASCADE로 profile/snapshot 등 연관 행 자동 삭제.
+  · "DELETE 0" 이면 대상이 없다는 뜻 → 404.
+
+
+────────────────────────────────────────────────
+router/SmokingDay.py
+────────────────────────────────────────────────
+역할
+  금연 플랜(quit_plan) CRUD. 금연 시작일·하루 흡연량·담배값 등을 관리.
+
+로직
+  · POST   : 이미 ACTIVE 플랜이 있으면 409(중복 방지) 후 신규 생성.
+  · GET    : 사용자의 ACTIVE 플랜 1건 반환(없으면 404).
+  · PUT    : ACTIVE 플랜 수정.
+  · PATCH /complete : status를 COMPLETED로 바꾸고 completed_at 기록.
+
+조건식 이유
+  · status='ACTIVE' 필터 : 한 사용자에 진행중 플랜은 하나만 유효하도록 강제.
+
+
+────────────────────────────────────────────────
+router/Bogunso.py
+────────────────────────────────────────────────
+역할
+  공공데이터 보건소 목록을 받아 카카오 지오코딩으로 좌표를 채워 제공.
+
+로직
+  · bogunso_coords.json 캐시에 이미 있는 주소는 건너뛴다(중복 호출 방지).
+  · 처음 보는 주소만 set으로 추려 Semaphore(20)로 동시요청 제한 후 변환.
+  · 변환 결과를 캐시 파일에 원자적(.tmp→replace)으로 저장.
+
+조건식 이유
+  · Semaphore : 카카오 API 과부하/차단을 막기 위한 동시성 제한.
+  · 캐시 우선 : 동일 주소를 매번 변환하면 비용/속도 손해라서.
+
+
+────────────────────────────────────────────────
+router/UserHeart.py
+────────────────────────────────────────────────
+역할
+  Watch에서 올라온 심박수를 저장/조회한다.
+
+로직
+  · POST /log   : 1건 저장. 유저 존재 확인 후 INSERT.
+  · POST /batch : 30초 윈도우 묶음 저장. 항목별로 INSERT 시도하고
+                  저장 N개 / 중복스킵 M개를 집계해 반환.
+  · 조회        : 최신 1건, 목록, 집계테이블(watch_heart_logs) 조회 제공.
+
+조건식 이유
+  · ON CONFLICT ON CONSTRAINT unique_user_hr DO NOTHING :
+      WatchConnectivity가 큐에 쌓인 메시지를 재전송하면서
+      "같은 사용자·같은 시각" 심박수가 중복 INSERT 되는 일이 있었다.
+      이를 무시(스킵)해 UniqueViolation 오류를 방지한다.
+  · execute() 결과 문자열이 " 1"로 끝나면 실제 저장, 아니면 중복 스킵으로 판정.
+
+
+────────────────────────────────────────────────
+router/AiModel/  (설문 기반 흡연성공 예측)
+────────────────────────────────────────────────
+TestModel.py
+  · POST /ai/predict : user_profile + 최신 snapshot을 읽어
+    BMI를 계산하고 mapper로 모델 입력 규격을 만든 뒤 predictor로 예측.
+  · 위험요인(스트레스/음주/직장간접흡연/BMI)을 top_risks로 추려 GPT 전달용 제공.
+
+mapper.py
+  · DB 값(성별 M/F, 출생연도, 결혼/직업/소득/음주 등)을
+    학습모델이 기대하는 숫자 코드(sex 1/2, age, BD2_1 1~5 등)로 변환.
+  · 값이 없으면 안전한 기본값(나이 30, BMI 22 등)으로 대체해 예측이 깨지지 않게 함.
+
+predictor.py / schemas.py
+  · 저장된 모델(joblib)을 로드해 입력 피처로 흡연성공 확률을 예측.
+
+(주의) 이 AiModel은 "설문 기반 금연 성공 예측"이고,
+       아래 smokingAiModel은 "Watch 모션 기반 실시간 흡연 행동 감지"로 별개다.
+
+
+────────────────────────────────────────────────
+router/MotionData.py   ★핵심 (Watch 모션 → 흡연 감지)
+────────────────────────────────────────────────
+역할
+  Watch가 보낸 30초 윈도우(24피처)를 저장하고, 흡연 여부를
+  2단계(Layer1 모델 + Layer2 HLSDA 보정)로 예측해 결과를 돌려준다.
+
+데이터 흐름
+  Watch(50Hz, 30초) → 24피처 → iPhone → POST /api/motion/window → 이 파일
+
+로직 (POST /window)
+  1. 유저 존재 확인(없으면 404).
+  2. watch_motion_features 테이블에 24피처 INSERT(RETURNING으로 저장행 회수).
+  3. 방금 저장한 measured_at 기준 "최근 5분(300초)" 윈도우만 조회.
+     - session_start = measured_at - timedelta(300) 를 파이썬에서 계산해 파라미터로 전달.
+     - 이렇게 해서 "현재 세션에서 수집된 윈도우들"만 모델 입력으로 사용한다
+       (과거 DB 이력 전체를 쓰지 않음).
+  4. 세션 윈도우들의 피처를 컬럼별 평균 → 평균 피처 1세트 생성.
+  5. Layer1 : smoking_predictor.predict_smoking(평균피처) → raw 라벨/확률.
+  6. Layer2 : 사용자별 in-memory 예측 시퀀스에 raw를 추가하고
+              hlsda_correct()로 보정 → 최종 라벨 결정.
+  7. is_smoking(보정값)/confidence/raw_label/corrected_label/세션윈도우수를
+     응답에 실어 반환(이 AI 결과는 DB에 저장하지 않음, 응답 전용).
+
+세션 캐시(_pred_cache / _pred_times)
+  · 사용자별 raw 예측 라벨 리스트를 메모리에 보관(HLSDA가 시퀀스를 봐야 하므로).
+  · TTL 400초(5분 세션 + 여유 100초) 초과 시 자동 리셋.
+  · DELETE /{user_id}/session : 수집 종료 시 캐시 강제 초기화.
+
+조건식/설계 이유
+  · _naive() 로 timezone 제거 :
+      measured_at 컬럼이 'timestamp without time zone'(naive)인데
+      timezone-aware 값을 넣으면 asyncpg가 빼기 연산에서 오류를 낸다.
+      그래서 UTC로 변환 후 tzinfo를 제거한 naive datetime으로 저장한다.
+  · INTERVAL SQL 대신 timedelta 파라미터 사용 :
+      naive 컬럼에 "$2 - INTERVAL" 연산을 쓰면 타입 충돌이 나서,
+      세션 시작 시각을 파이썬에서 미리 계산해 넘긴다.
+  · 세션 평균을 쓰는 이유 :
+      한 윈도우만 보면 노이즈에 흔들리므로 5분 세션 평균으로 안정화.
+
+reanalyze (GET /{user_id}/reanalyze)
+  · 수동 수집 후 "모델에 입력" 버튼용. 새 INSERT 없이 최근 5분 데이터로
+    다시 평균→Layer1→HLSDA 예측만 수행해 결과 반환.
+
+
+────────────────────────────────────────────────
+router/smokingAiModel/smoking_predictor.py   (Layer1)
+────────────────────────────────────────────────
+역할
+  smoking_rf_binary.pkl(sklearn Pipeline: StandardScaler+RandomForest)로
+  흡연 여부를 예측하는 1차 분류기.
+
+로직
+  · pkl 구조 : {pipeline, features(24개), classes(['non_smoke','smoke'])}.
+  · DB 피처명 → pkl 피처명 매핑(_DB_TO_PKL):
+       accel_x_max → acc_x_max,  accel_x_skewness → acc_x_skew,
+       accel_x_kurtosis → acc_x_kurt ...
+  · 입력 벡터는 반드시 pkl의 features 순서대로 구성한다
+       row = [pkl_vals.get(f, 0.0) for f in _features]
+    → 입력 dict 순서와 무관하게 항상 학습 때와 같은 순서를 보장.
+  · predict로 라벨, predict_proba로 smoke 확률(confidence) 산출.
+
+조건식 이유
+  · 매핑에 없는/누락 피처는 0.0으로 대체하고 경고 로그를 남긴다
+    (피처 하나가 빠져도 예측 자체는 진행되게 하기 위함).
+  · classes_.index("smoke") 로 smoke 위치를 찾는 것은 클래스 순서가
+    바뀌어도 올바른 확률을 읽기 위함.
+
+
+────────────────────────────────────────────────
+router/smokingAiModel/hlsda_postprocess.py   (Layer2)
+────────────────────────────────────────────────
+역할
+  Layer1의 시간순 예측 시퀀스에서 "끼인 오분류"를 양옆 값으로 보정한다.
+  (흡연은 보통 수 분간 연속되므로, 한두 개만 다른 라벨이면 오답 가능성이 높다.)
+
+로직 (sandwich rule 3종)
+  · Rule 1 : [A A X A A] 처럼 1개 끼인 오답 → X를 A로 교정.
+  · Rule 2 : 2개 연속 끼인 오답을 양옆 다수값으로 교정.
+  · Rule 3 : 이동 윈도우(winlimit=10) 안에서 단발성(count=1) 흡연 오탐 보정.
+
+주의
+  · 입력은 "한 사용자"의 시간순 리스트여야 한다.
+  · 과거 시점을 고쳐가며 보정하므로 확정까지 최대 30~90초 지연이 생길 수 있다.
+  · 라벨 문자열('smoke'/'non_smoke')은 학습모델과 동일해야 한다.
+
+
+────────────────────────────────────────────────
+router/gpt/  (GptTast.py / service.py / schemas.py)
+────────────────────────────────────────────────
+역할
+  OpenAI를 호출해 사용자 맞춤 금연 코칭/분석 텍스트를 생성하는 모듈.
+  · schemas : 요청/응답 모델 정의.
+  · service : OpenAI 호출 및 프롬프트 구성 로직.
+  · GptTast : 라우터(엔드포인트) — service를 호출해 결과 반환.
+
+
+
+################################################################
+[ PART 2 ] 프론트엔드  '-2-' / ios
+################################################################
+
+구성
+  · App/                : iPhone(Capacitor) 앱 + 웹↔네이티브 브리지, Watch 통신
+  · GeumyeonWatch Watch App/ : Apple Watch 앱(센서수집·심박·UI)
+  · GeumyeonWatch App/  : Watch 앱의 iOS 동반(껍데기) 타깃
+
+
+────────────────────────────────────────────────
+App/AppDelegate.swift
+────────────────────────────────────────────────
+역할
+  iPhone 앱 시작점. WebView(React) ↔ Watch 사이의 로그인/동기화를 중계.
+
+로직
+  · 시작 시 PhoneConnectivityManager 활성화.
+  · NotificationCenter 옵저버 등록:
+      - watchUserLogin : 웹 로그인 정보를 받아 UserDefaults 저장 후 Watch로 전송.
+      - watchNeedsRelogin : 서버에 userId가 없으면 WebView localStorage 비우고 새로고침.
+      - watchCrisisAlert : 위기 알림을 Watch로 즉시 전달.
+  · applicationDidBecomeActive : localStorage의 user를 읽어 Watch로 자동 동기화.
+      - WebView 로딩 중이거나 브리지 미준비면 최대 10회(1초 간격) 재시도.
+
+조건식 이유
+  · 재시도 로직 : 앱 활성화 시점에 WebView가 아직 로딩 중이라
+    localStorage 접근이 실패할 수 있어 준비될 때까지 기다리기 위함.
+
+
+────────────────────────────────────────────────
+App/WatchBridgePlugin.swift
+────────────────────────────────────────────────
+역할
+  웹(JS) → 네이티브 브리지. JS에서 호출하면 NotificationCenter 이벤트를 쏜다.
+
+로직
+  · notifyLogin(userId,userName,userLoginId) → watchUserLogin 알림 발송.
+  · notifyCrisis(userName,savedMoney)        → watchCrisisAlert 알림 발송.
+  · 필수 필드가 없으면 call.reject로 JS에 에러 반환.
+
+
+────────────────────────────────────────────────
+App/HeartRateSyncPlugin.swift
+────────────────────────────────────────────────
+역할
+  Watch에서 받은 심박수를 웹(React)에 전달하는 브리지.
+
+로직
+  · getLatestHeartRate() : UserDefaults에 캐시된 최신 BPM을 JS에 반환(pull).
+  · heartRateReceived 알림 수신 시 notifyListeners("heartRateUpdate")로 push.
+  · bpm<=0 이거나 시각이 비면 빈 객체 반환(아직 수신 전).
+
+
+────────────────────────────────────────────────
+App/QuitDaySyncPlugin.swift
+────────────────────────────────────────────────
+역할
+  웹의 금연 일수를 Watch로 전달하는 브리지.
+
+로직
+  · syncQuitDays(quitDays) → PhoneConnectivityManager.sendQuitDaysToWatch 호출.
+  · quitDays 필드 없으면 reject.
+
+
+────────────────────────────────────────────────
+App/PhoneConnectivityManager.swift   ★iPhone↔Watch 통신 허브
+────────────────────────────────────────────────
+역할
+  WatchConnectivity로 Watch와 양방향 통신하고, Watch가 보낸 데이터를
+  백엔드 API로 중계하며, AI 결과를 다시 Watch로 돌려보낸다.
+
+iPhone → Watch
+  · sendUserInfoToWatch : updateApplicationContext로 로그인정보 전송(영속 컨텍스트).
+  · sendQuitDaysToWatch : 금연일수 전송.
+  · sendCrisisAlertToWatch : 위기 알림(즉시 sendMessage).
+
+Watch → iPhone (수신 분기)
+  · didReceiveMessage(즉시) / didReceiveUserInfo(큐) 두 경로 모두 처리.
+  · type별 분기:
+      - requestUserInfo : 저장된 유저정보 재전송.
+      - motionWindow    : 24피처 → /api/motion/window 로 POST → AI결과 처리.
+      - heartRateBatch  : /api/UserHeart/batch 로 POST + 최신BPM 캐시/이벤트.
+      - hrvSpike        : iPhone 로컬 알림 표시.
+      - sessionEnd      : DELETE /api/motion/{id}/session (HLSDA 캐시 리셋).
+      - reanalyzeRequest: GET /api/motion/{id}/reanalyze (재예측).
+
+handleMotionWindow 로직
+  · 6축×4통계(max/min/skewness/kurtosis) 24개 키를 파싱.
+  · 누락 키는 0.0으로 채우고 경고 로그(피처 부족해도 전송은 진행).
+  · 응답을 handleSmokingPrediction으로 넘긴다.
+
+handleSmokingPrediction 로직
+  · is_smoking이 있으면(서버 정상) 흡연/비흡연 상관없이
+    "motionResult" 메시지를 항상 Watch로 전송한다.
+      - 이유 : 예전에는 흡연일 때만 보내서 비흡연이면 Watch에 결과가
+        안 떴다. 결과 카드를 항상 갱신하려고 항상 전송으로 바꿈.
+  · reachable이면 sendMessage, 실패/미연결이면 transferUserInfo로 재시도.
+
+조건식 이유
+  · 두 수신 경로(message/userInfo)를 모두 다루는 것은 Watch가 연결 상태에 따라
+    즉시(sendMessage) 또는 큐(transferUserInfo)로 보내기 때문.
+
+
+────────────────────────────────────────────────
+GeumyeonWatch Watch App/GeumyeonWatchApp.swift
+────────────────────────────────────────────────
+역할
+  Watch 앱 진입점. 시작 시 WatchConnectivityManager 활성화 후 ContentView 표시.
+
+
+────────────────────────────────────────────────
+GeumyeonWatch Watch App/Managers/WatchConnectivityManager.swift
+────────────────────────────────────────────────
+역할
+  Watch 쪽 통신 관리자. iPhone과 데이터를 주고받고, 수신한 AI 결과를
+  UI 상태(@Published)로 반영하며 로컬 알림을 띄운다.
+
+로직
+  · activate / requestUserInfo : 로그인정보 수신/재요청.
+  · sendHeartRateBatch : 심박 묶음을 transferUserInfo로 iPhone에 전송.
+  · requestNotificationPermission : 알림 권한 + 카테고리(HRV_SPIKE/OPEN_IPHONE) 등록.
+  · handleIncoming(type 분기):
+      - motionResult : is_smoking/confidence/raw/corrected/윈도우수를 받아
+        applyMotionResult로 UI 갱신, 흡연이면 알림 시트+로컬알림.
+      - smokingAlert(레거시) : 무조건 흡연으로 처리.
+      - 그 외 : applyContext(로그인/금연일수 갱신).
+  · handleHRVSpike : HRV 급상승 시 인앱 동의 시트 표시 + iPhone에 hrvSpike 전달.
+  · notifySessionEnd / requestReanalyze : 세션종료·재분석 신호를 iPhone에 전송.
+
+조건식 이유
+  · isReachable로 sendMessage(즉시)와 transferUserInfo(큐)를 분기해
+    iPhone이 꺼져 있어도 데이터가 유실되지 않게 한다.
+
+
+────────────────────────────────────────────────
+GeumyeonWatch Watch App/Managers/MotionManager.swift   ★센서 수집
+────────────────────────────────────────────────
+역할
+  손목 모션을 50Hz로 수집해 30초마다 24개 통계 피처로 요약하고 전송한다.
+  수집 중에는 화면을 계속 켜둔다.
+
+로직
+  · startRecording(mode) : .manual(버튼) / .auto(HRV 자동) 모드로 시작.
+      - CMMotionManager 50Hz로 6축(가속도 3 + 자이로 3) 누적.
+      - 30초 windowTimer마다 flushWindow, 1초 sessionTimer로 남은시간 카운트.
+      - WKExtendedRuntimeSession으로 수집 중 화면 유지.
+  · computeStats : 각 축의 max/min/왜도(skewness)/첨도(kurtosis) 계산.
+      - 표준편차가 0에 가까우면(거의 정지) 왜도·첨도를 0으로(0나눗셈 방지).
+  · flushWindow : 24피처 payload(키명=DB 컬럼명) 구성 → transferUserInfo 전송.
+      - isReachable로 "직접 전송 / 큐 저장"을 로그·알림으로 안내.
+  · stopRecording : 타이머·센서·화면세션 정리, 남은 버퍼 flush.
+      - 수동 모드면 pendingManualInput=true(=> "모델에 입력" 버튼 노출) + 완료 알림.
+
+핵심 수정/조건식 이유
+  · 수집 중간 자동 중단 방지 :
+      WKExtendedRuntimeSession이 만료/오류로 무효화되면 화면이 꺼지고
+      앱이 백그라운드로 가 타이머가 멈춘다. 그래서 didInvalidateWith에서
+      isRecording이면 세션을 즉시 재시작한다.
+      (willExpire에서 새로 만들면 이전 세션과 겹쳐 .sessionInProgress
+       오류가 나므로, 재시작은 무효화 콜백에서만 한다.)
+  · payload 키를 DB 컬럼명과 동일(accel_x_skewness 등)하게 맞춰
+    iPhone→백엔드까지 변환 없이 그대로 흐르게 한다.
+
+
+────────────────────────────────────────────────
+GeumyeonWatch Watch App/Managers/HealthManager.swift   ★심박/HRV
+────────────────────────────────────────────────
+역할
+  HealthKit으로 실시간 심박수를 읽고, 10초마다 HRV(RMSSD)를 계산해
+  급상승(흡연 의심) 시 자동 수집 트리거를 발생시킨다.
+
+로직
+  · requestAuthorization : 심박 읽기 권한 요청 후 HR 쿼리 + HRV 모니터링 시작.
+  · startHeartRateQuery : HKAnchoredObjectQuery로 새 심박 샘플을 실시간 수신.
+      - 최신 BPM을 currentBPM에 반영, bpmHistory(최대 20개)에 누적.
+      - 세션 중이면 hrBuffer에도 쌓아 30초마다 배치 전송.
+  · computeRMSSD : BPM → RR간격(ms=60000/BPM) 변환 후
+      연속 차이 제곱 평균의 제곱근(=RMSSD).
+  · evaluateHRV(10초마다):
+      - 기저값(baselineRMSSD)을 EMA(0.8*기존+0.2*현재)로 갱신.
+      - rmssd > baseline*1.8 이면 급상승으로 판정 → handleHRVSpike.
+
+조건식 이유
+  · baseline < 최소값(10ms)일 때 초기화 : 측정 초반 불안정 구간 보호.
+  · SPIKE_COOLDOWN(300초) : 한 번 트리거 후 5분간 재트리거 방지(과민반응 차단).
+  · bpmHistory>=3 일 때만 계산 : 표본이 너무 적으면 RMSSD가 무의미하므로.
+
+
+────────────────────────────────────────────────
+GeumyeonWatch Watch App/Managers/APIService.swift
+────────────────────────────────────────────────
+역할
+  Watch가 직접 백엔드를 호출하는 경량 클라이언트(금연일수 조회, 심박 단건 전송).
+
+로직
+  · fetchSmokingDay : GET /api/SmokingDay/{userId}.
+      - 404/400이면 서버 detail 메시지를 파싱해 의미있는 에러로 변환.
+  · postHeartRate : POST /api/UserHeart/{userId} 로 단건 전송.
+
+
+────────────────────────────────────────────────
+GeumyeonWatch Watch App/ViewModels/SmokingDayViewModel.swift
+────────────────────────────────────────────────
+역할
+  금연 화면 상태(금연일수/회복점수/절약금액/시작일)를 계산·보유.
+
+로직
+  · load(userId) : APIService로 플랜을 받아
+      - 시작일로 금연일수 계산, 회복점수=일수/360*100(최대 100),
+      - 절약금액=하루개비×(담배값/갑당개비)×일수 로 환산.
+
+
+────────────────────────────────────────────────
+GeumyeonWatch Watch App/Views/ContentView.swift   ★Watch UI
+────────────────────────────────────────────────
+역할
+  Watch 화면 전체. 로그인 대기/탭 화면/센서 수집/AI결과/HRV 동의 등을 표시.
+
+구성(주요 뷰)
+  · ContentView      : 매니저 연결, 로그인 여부에 따라 대기/메인 분기,
+                       healthManager.onHRVSpike → connectivity.handleHRVSpike 연결.
+  · WaitingLoginView : 미로그인 시 안내 화면.
+  · MainTabView      : 금연/심박/절약/모션 탭.
+  · QuitDayTab/HeartRateTab/SavingsTab : 각 지표 표시(심박탭은 HRV도 표시).
+  · MotionTab        : 수집 시작/정지, 실시간 센서값, AI 결과 카드
+      - HLSDA 보정 표시(raw→corrected, 바뀌면 주황색 강조),
+      - 수동 수집 후 "최근 데이터 모델 입력" 버튼(=connectivity.requestReanalyze),
+      - 자동 수집 중에는 정지 버튼 비활성화.
+  · SmokingAlertView : 흡연 감지 시트(raw→corrected 보정 정보 포함).
+  · HRVConsentView   : HRV 급상승 시 자동수집 "허용/거부" 동의 시트.
+
+조건식/주의
+  · WCSession은 View에서 직접 쓰지 않고 connectivity 매니저 메서드로 호출한다
+    (WatchConnectivity import를 View에 두지 않기 위함).
+  · foregroundStyle 삼항에서 한쪽이 Color(.orange)면 다른쪽도 Color로 맞춘다
+    (.tertiary는 ShapeStyle만 있어 Color 자리에서 타입 충돌).
+
+
+────────────────────────────────────────────────
+GeumyeonWatch App/  (geumyeonhaeduo2026App.swift, ContentView.swift)
+────────────────────────────────────────────────
+역할
+  Watch 앱의 iOS 동반(껍데기) 타깃. 현재는 기본 템플릿 화면만 있고
+  실제 기능은 Watch App 타깃에 구현되어 있다.
+
+
+================================================================
+전체 데이터 흐름 요약
+================================================================
+
+[흡연 감지]
+  Watch 50Hz 모션 → 30초 윈도우 24피처(MotionManager)
+   → iPhone(PhoneConnectivityManager) → POST /api/motion/window
+   → 세션 5분 평균 → Layer1(pkl RandomForest) → Layer2(HLSDA 보정)
+   → 결과(motionResult) → iPhone → Watch 알림/결과카드
+
+[HRV 자동 트리거]
+  Watch 심박(HealthManager) 10초마다 RMSSD 계산 → 급상승 감지
+   → 동의(HRVConsentView) → 자동 5분 수집(.auto) → 위와 동일 파이프라인
+
+[심박 동기화]
+  Watch 심박 30초 배치 → iPhone → POST /api/UserHeart/batch
+   → 스케줄러가 10초마다 평균 집계 → watch_heart_logs
+================================================================

@@ -1,0 +1,33 @@
+# ===== 공통 =====
+.DS_Store
+*.log
+.idea/
+.vscode/
+
+# ===== 비밀/환경변수 (절대 커밋 금지) =====
+.env
+.env.*
+!.env.example
+*_backup_*.sql
+
+# ===== 백엔드 (Python) =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ===== 프론트엔드 (Node / Vite) =====
+node_modules/
+프론트/dist/
+프론트/build/
+프론트/coverage/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ===== iOS / Capacitor =====
+프론트/ios/App/CapApp-SPM/.build/
+프론트/ios/App/Pods/
+*.xcuserstate
+xcuserdata/

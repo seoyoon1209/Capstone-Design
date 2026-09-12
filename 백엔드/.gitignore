@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+.vscode/
+
+# secrets / backups
+.env
+_dropped_tables_backup_*.sql
